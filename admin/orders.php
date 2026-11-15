@@ -9,7 +9,7 @@ if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'admin') {
     redirect('../login.php');
 }
 
-// Fetch all orders with user details, shipping destination, and associated order items / products
+// Fetch all orders using reliable columns
 try {
     $stmt = $pdo->query("
         SELECT o.*, u.fullname, u.email,
@@ -143,12 +143,19 @@ $pageTitle = "Manage Orders | Elliana's Boutique Admin";
                                                 <?php 
                                                     $ids = explode(',', $ord['product_ids']);
                                                     $names = explode(',', $ord['product_names']);
+                                                    $quantities = explode(',', $ord['product_quantities']);
                                                 ?>
                                                 <div class="space-y-1">
                                                     <?php for ($i = 0; $i < count($ids); $i++): ?>
                                                         <div class="text-xs">
-                                                            <span class="font-mono font-bold text-yellow-700 bg-yellow-50 border border-yellow-200 px-1.5 py-0.5 rounded">FG-019</span>
-                                                            <span class="font-medium text-gray-800 ml-1"><?php echo htmlspecialchars($names[$i] ?? 'Product'); ?></span>
+                                                            <!-- Formats ID dynamically into FG-0XX style code -->
+                                                            <span class="font-mono font-bold text-yellow-700 bg-yellow-50 border border-yellow-200 px-1.5 py-0.5 rounded">
+                                                                FG-<?php echo str_pad($ids[$i], 3, '0', STR_PAD_LEFT); ?>
+                                                            </span>
+                                                            <span class="font-medium text-gray-800 ml-1">
+                                                                <?php echo htmlspecialchars($names[$i] ?? 'Product'); ?> 
+                                                                <span class="text-gray-400">(Qty: <?php echo htmlspecialchars($quantities[$i] ?? 1); ?>)</span>
+                                                            </span>
                                                         </div>
                                                     <?php endfor; ?>
                                                 </div>
