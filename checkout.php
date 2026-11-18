@@ -3,15 +3,16 @@
 session_start();
 require_once 'config/database.php';
 require_once 'includes/functions.php';
+require_once 'includes/IntegrationClient.php';
 
 // Require login before checking out
 if (!isset($_SESSION['user_id'])) {
     redirect('login.php');
 }
 
-// RESTRICT ADMIN FROM PURCHASING
+// Restrict admin from purchasing
 if (isset($_SESSION['role']) && $_SESSION['role'] === 'admin') {
-    $_SESSION['error'] = "Administrators cannot place orders or purchase items from the store front.";
+    $_SESSION['error'] = "Administrators cannot place orders or purchase items from the storefront.";
     redirect('admin/dashboard.php');
 }
 
@@ -22,6 +23,7 @@ if (empty($_SESSION['cart'])) {
 
 $error = '';
 $order_success = false;
+$placed_order_details = [];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $fullname = sanitize($_POST['fullname'] ?? '');
@@ -32,73 +34,117 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $shipping_method = sanitize($_POST['shipping_method'] ?? 'J&T Express');
     $payment_method = sanitize($_POST['payment_method'] ?? 'GCash');
 
-    // Set shipping fee based on selection (e.g., J&T Express = ₱150)
-    $shipping_fee = ($shipping_method === 'J&T Express') ? 150.00 : 80.00;
-
     if (empty($fullname) || empty($email) || empty($address) || empty($city) || empty($zip)) {
         $error = "Please fill in all shipping details.";
     } else {
-        try {
-            // Calculate items subtotal factoring active sale/discount prices
-            $subtotal = 0;
-            foreach ($_SESSION['cart'] as $item) {
-                $item_price = (!empty($item['discount_price']) && $item['discount_price'] > 0 && $item['discount_price'] < $item['price']) ? $item['discount_price'] : $item['price'];
-                $subtotal += $item_price * $item['quantity'];
+        // Calculate items subtotal factoring active sale/discount prices
+        $subtotal = 0;
+        foreach ($_SESSION['cart'] as $item) {
+            $item_price = (!empty($item['discount_price']) && $item['discount_price'] > 0 && $item['discount_price'] < $item['price'])
+                ? $item['discount_price']
+                : $item['price'];
+            $subtotal += $item_price * $item['quantity'];
+        }
+
+        // Initialize Reusable Integration Client (3s timeout, 2 retries)
+        $integrator = new IntegrationClient(3, 2);
+
+        // --- INTEGRATION POINT 1: Logistics & Waybill Microservice ---
+        $logisticsRes = $integrator->requestWaybill($shipping_method, $city, $zip);
+        $integrationStatus = 'SYNCED';
+        $trackingNumber = null;
+
+        if ($logisticsRes['success']) {
+            $shipping_fee = $logisticsRes['shipping_fee'];
+            $trackingNumber = $logisticsRes['tracking_number'];
+        } else {
+            // Graceful Degradation Fallback if Logistics Service fails/times out
+            $shipping_fee = 150.00;
+            $trackingNumber = 'PENDING-WAYBILL';
+            $integrationStatus = 'DEGRADED_' . ($logisticsRes['error_type'] ?? 'LOGISTICS');
+        }
+
+        $total_amount = $subtotal + $shipping_fee;
+        $user_id = $_SESSION['user_id'];
+
+        // --- INTEGRATION POINT 2: Stripe Payment Gateway API ---
+        $paymentRes = $integrator->createPaymentIntent(
+            $total_amount,
+            $payment_method,
+            "Elliana's Boutique Order for " . $fullname
+        );
+
+        if (!$paymentRes['success']) {
+            // Payment is critical: block order creation if payment gateway fails
+            $error = "Payment Gateway Error (" . htmlspecialchars($paymentRes['error_type']) . "): " . htmlspecialchars($paymentRes['message']);
+        } else {
+            $paymentReference = $paymentRes['payment_reference'];
+
+            try {
+                $pdo->beginTransaction();
+
+                // 1. Insert into orders table with integration metadata
+                $stmt = $pdo->prepare("
+                    INSERT INTO orders (
+                        user_id, total_amount, shipping_method, tracking_number,
+                        shipping_fee, payment_method, payment_reference,
+                        address, city, zip, status, integration_status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Purchased', ?, NOW())
+                ");
+                $stmt->execute([
+                    $user_id, $total_amount, $shipping_method, $trackingNumber,
+                    $shipping_fee, $payment_method, $paymentReference,
+                    $address, $city, $zip, $integrationStatus
+                ]);
+                $order_id = $pdo->lastInsertId();
+
+                // 2. Insert order items and reduce stock
+                $itemStmt = $pdo->prepare("INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)");
+                $updateStockStmt = $pdo->prepare("
+                    UPDATE products
+                    SET stock = stock - ?,
+                        is_available = CASE WHEN (stock - ?) <= 0 THEN 0 ELSE 1 END
+                    WHERE id = ?
+                ");
+
+                foreach ($_SESSION['cart'] as $item) {
+                    $productId = $item['id'] ?? $item['product_id'] ?? 0;
+                    $quantity = (int) ($item['quantity'] ?? 1);
+                    $effective_price = (!empty($item['discount_price']) && $item['discount_price'] > 0 && $item['discount_price'] < $item['price'])
+                        ? $item['discount_price']
+                        : $item['price'];
+
+                    $itemStmt->execute([$order_id, $productId, $quantity, $effective_price]);
+                    $updateStockStmt->execute([$quantity, $quantity, $productId]);
+                }
+
+                $pdo->commit();
+                $_SESSION['cart'] = [];
+                $order_success = true;
+                $placed_order_details = [
+                    'order_id' => $order_id,
+                    'payment_reference' => $paymentReference,
+                    'tracking_number' => $trackingNumber,
+                    'integration_status' => $integrationStatus,
+                    'total_amount' => $total_amount
+                ];
+            } catch (PDOException $e) {
+                $pdo->rollBack();
+                $error = "Database checkout error: " . $e->getMessage();
             }
-            $total_amount = $subtotal + $shipping_fee;
-
-            $user_id = $_SESSION['user_id'];
-
-            // Begin transaction
-            $pdo->beginTransaction();
-
-            // 1. Insert into orders table with delivery address
-            $stmt = $pdo->prepare("INSERT INTO orders (user_id, total_amount, shipping_method, shipping_fee, payment_method, address, city, zip, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Purchased', NOW())");
-            $stmt->execute([$user_id, $total_amount, $shipping_method, $shipping_fee, $payment_method, $address, $city, $zip]);
-            $order_id = $pdo->lastInsertId();
-
-            // 2. Prepare statements for order items and stock reduction
-            $itemStmt = $pdo->prepare("INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)");
-            
-            $updateStockStmt = $pdo->prepare("
-                UPDATE products 
-                SET stock = stock - ?, 
-                    is_available = CASE WHEN (stock - ?) <= 0 THEN 0 ELSE 1 END 
-                WHERE id = ?
-            ");
-            
-            foreach ($_SESSION['cart'] as $item) {
-                $productId = $item['id'] ?? $item['product_id'] ?? 0;
-                $quantity = (int)($item['quantity'] ?? 1);
-                // Save the actual discounted transaction price paid if on sale
-                $effective_price = (!empty($item['discount_price']) && $item['discount_price'] > 0 && $item['discount_price'] < $item['price']) ? $item['discount_price'] : $item['price'];
-
-                // Save order item record
-                $itemStmt->execute([$order_id, $productId, $quantity, $effective_price]);
-                
-                // Deduct stock and synchronize global availability state
-                $updateStockStmt->execute([$quantity, $quantity, $productId]);
-            }
-
-            // Commit transaction
-            $pdo->commit();
-
-            // Clear the cart
-            $_SESSION['cart'] = [];
-            $order_success = true;
-
-        } catch (PDOException $e) {
-            $pdo->rollBack();
-            $error = "Checkout error: " . $e->getMessage();
         }
     }
 }
 
-// Calculate subtotal for review display factoring sale discounts
+// Calculate subtotal for display
 $current_subtotal = 0;
-foreach ($_SESSION['cart'] as $item) {
-    $item_price = (!empty($item['discount_price']) && $item['discount_price'] > 0 && $item['discount_price'] < $item['price']) ? $item['discount_price'] : $item['price'];
-    $current_subtotal += $item_price * $item['quantity'];
+if (!empty($_SESSION['cart'])) {
+    foreach ($_SESSION['cart'] as $item) {
+        $item_price = (!empty($item['discount_price']) && $item['discount_price'] > 0 && $item['discount_price'] < $item['price'])
+            ? $item['discount_price']
+            : $item['price'];
+        $current_subtotal += $item_price * $item['quantity'];
+    }
 }
 
 $pageTitle = "Checkout | Elliana's Boutique";
@@ -109,46 +155,59 @@ include 'includes/header.php';
     <h1 class="text-3xl font-bold text-gray-900 mb-6">Checkout</h1>
 
     <?php if ($order_success): ?>
-        <div class="bg-white border border-gray-200 rounded-2xl p-12 text-center shadow-sm">
-            <div class="h-16 w-16 bg-green-50 text-green-600 rounded-full flex items-center justify-center mx-auto mb-4 text-2xl">
+        <div class="bg-white border border-gray-200 rounded-2xl p-10 text-center shadow-sm space-y-4">
+            <div class="h-16 w-16 bg-green-50 text-green-600 rounded-full flex items-center justify-center mx-auto text-2xl">
                 <i class="fa-solid fa-check"></i>
             </div>
-            <h2 class="text-2xl font-bold text-gray-900">Order Placed Successfully!</h2>
-            <p class="text-sm text-gray-500 mt-2">Thank you for shopping with Elliana's Boutique. We are packing your order with care.</p>
-            <div class="mt-6">
-                <a href="index.php" class="px-6 py-3 bg-yellow-500 text-white font-medium rounded-xl shadow hover:bg-yellow-600 transition-colors">Return to Homepage</a>
+            <h2 class="text-2xl font-bold text-gray-900">Order #<?php echo $placed_order_details['order_id']; ?> Placed Successfully!</h2>
+            <p class="text-sm text-gray-500">Thank you for shopping with Elliana's Boutique.</p>
+
+            <!-- Integration Receipt Box -->
+            <div class="max-w-md mx-auto bg-gray-50 border border-gray-200 rounded-xl p-4 text-left text-xs space-y-2">
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Stripe Payment Ref:</span>
+                    <span class="font-mono font-bold text-gray-800"><?php echo htmlspecialchars($placed_order_details['payment_reference']); ?></span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Courier Waybill:</span>
+                    <span class="font-mono font-bold text-gray-800"><?php echo htmlspecialchars($placed_order_details['tracking_number']); ?></span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Integration Status:</span>
+                    <span class="font-mono font-bold <?php echo $placed_order_details['integration_status'] === 'SYNCED' ? 'text-green-600' : 'text-amber-600'; ?>">
+                        <?php echo htmlspecialchars($placed_order_details['integration_status']); ?>
+                    </span>
+                </div>
+            </div>
+
+            <div class="pt-4">
+                <a href="my-orders.php" class="px-6 py-3 bg-yellow-500 text-white font-medium rounded-xl shadow hover:bg-yellow-600 transition-colors">View My Orders</a>
             </div>
         </div>
     <?php else: ?>
-
         <?php if (!empty($error)): ?>
-            <div class="mb-4 p-4 bg-red-50 border border-red-200 text-red-600 rounded-xl text-sm">
+            <div class="mb-4 p-4 bg-red-50 border border-red-200 text-red-600 rounded-xl text-sm font-medium">
                 <?php echo $error; ?>
             </div>
         <?php endif; ?>
 
         <form action="checkout.php" method="POST" class="grid grid-cols-1 md:grid-cols-3 gap-8">
-            <!-- Left 2 Columns: Shipping & Payment Info -->
             <div class="md:col-span-2 space-y-6">
                 <!-- Shipping Details -->
                 <div class="bg-white border border-gray-200 rounded-2xl p-6 shadow-sm space-y-4">
                     <h2 class="text-lg font-bold text-gray-900">1. Shipping Information</h2>
-
                     <div>
                         <label class="block text-sm font-medium text-gray-700">Full Name</label>
                         <input type="text" name="fullname" value="<?php echo htmlspecialchars($_SESSION['fullname'] ?? ''); ?>" required class="mt-1 block w-full px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:ring-yellow-500 focus:border-yellow-500">
                     </div>
-
                     <div>
                         <label class="block text-sm font-medium text-gray-700">Email Address</label>
                         <input type="email" name="email" required placeholder="name@example.com" class="mt-1 block w-full px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:ring-yellow-500 focus:border-yellow-500">
                     </div>
-
                     <div>
                         <label class="block text-sm font-medium text-gray-700">Street Address / Barangay</label>
                         <input type="text" name="address" required placeholder="House No., Street, Barangay" class="mt-1 block w-full px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:ring-yellow-500 focus:border-yellow-500">
                     </div>
-
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <div>
                             <label class="block text-sm font-medium text-gray-700">City / Municipality</label>
@@ -169,31 +228,30 @@ include 'includes/header.php';
                             <div class="flex items-center space-x-3">
                                 <input type="radio" name="shipping_method" value="J&T Express" checked class="text-yellow-500 focus:ring-yellow-500">
                                 <div>
-                                    <p class="font-bold text-gray-900 text-sm">J&T Express Courier</p>
-                                    <p class="text-xs text-gray-500">1-3 business days (Express tracking)</p>
+                                    <p class="font-bold text-gray-900 text-sm">J&T Express Courier (API Dynamic Rate)</p>
+                                    <p class="text-xs text-gray-500">1-3 business days (Auto-generates waybill via Logistics API)</p>
                                 </div>
                             </div>
-                            <span class="font-semibold text-gray-900 text-sm">₱150.00</span>
+                            <span class="font-semibold text-gray-900 text-sm">Calculated at Checkout</span>
                         </label>
                     </div>
                 </div>
 
                 <!-- Payment Gateways -->
                 <div class="bg-white border border-gray-200 rounded-2xl p-6 shadow-sm space-y-4">
-                    <h2 class="text-lg font-bold text-gray-900">3. Select Payment Method</h2>
+                    <h2 class="text-lg font-bold text-gray-900">3. Select Payment Method (Stripe Sandbox)</h2>
                     <div class="space-y-3">
                         <label class="flex items-center space-x-3 p-4 border border-gray-200 rounded-xl cursor-pointer hover:border-yellow-500 transition-colors">
                             <input type="radio" name="payment_method" value="GCash" checked class="text-yellow-500 focus:ring-yellow-500">
                             <div>
                                 <p class="font-bold text-gray-900 text-sm">GCash E-Wallet</p>
-                                <p class="text-xs text-gray-500">Scan QR code or direct mobile wallet transfer</p>
+                                <p class="text-xs text-gray-500">Processed via Payment Intent API</p>
                             </div>
                         </label>
-
                         <label class="flex items-center space-x-3 p-4 border border-gray-200 rounded-xl cursor-pointer hover:border-yellow-500 transition-colors">
                             <input type="radio" name="payment_method" value="Credit/Debit Card" class="text-yellow-500 focus:ring-yellow-500">
                             <div>
-                                <p class="font-bold text-gray-900 text-sm">Credit or Debit Card (Maya / Visa / Mastercard)</p>
+                                <p class="font-bold text-gray-900 text-sm">Credit or Debit Card (Visa / Mastercard)</p>
                                 <p class="text-xs text-gray-500">Instant online secure card processing</p>
                             </div>
                         </label>
@@ -205,24 +263,18 @@ include 'includes/header.php';
             <div>
                 <div class="bg-white border border-gray-200 rounded-2xl p-6 shadow-sm sticky top-6 space-y-4">
                     <h2 class="text-lg font-bold text-gray-900 border-b pb-3">Order Summary</h2>
-                    
                     <div class="space-y-3 max-h-56 overflow-y-auto pr-1">
-                        <?php foreach ($_SESSION['cart'] as $item): 
+                        <?php foreach ($_SESSION['cart'] as $item):
                             $has_item_discount = !empty($item['discount_price']) && $item['discount_price'] > 0 && $item['discount_price'] < $item['price'];
                             $active_price = $has_item_discount ? $item['discount_price'] : $item['price'];
                         ?>
                             <div class="flex justify-between items-start text-xs text-gray-600 border-b border-gray-50 pb-2">
                                 <div>
                                     <span class="font-bold text-gray-900 block"><?php echo htmlspecialchars($item['name']); ?></span>
-                                    <span class="text-[11px] text-gray-400">Size: <?php echo htmlspecialchars($item['size'] ?? 'Standard'); ?> × <?php echo $item['quantity']; ?></span>
+                                    <span class="text-[11px] text-gray-400">Size: <?php echo htmlspecialchars($item['size'] ?? 'Standard'); ?> x <?php echo $item['quantity']; ?></span>
                                 </div>
                                 <div class="text-right">
-                                    <?php if ($has_item_discount): ?>
-                                        <span class="font-extrabold text-red-600 block"><?php echo formatPrice($active_price * $item['quantity']); ?></span>
-                                        <span class="text-[10px] text-gray-400 line-through"><?php echo formatPrice($item['price'] * $item['quantity']); ?></span>
-                                    <?php else: ?>
-                                        <span class="font-bold text-gray-900"><?php echo formatPrice($active_price * $item['quantity']); ?></span>
-                                    <?php endif; ?>
+                                    <span class="font-bold text-gray-900"><?php echo formatPrice($active_price * $item['quantity']); ?></span>
                                 </div>
                             </div>
                         <?php endforeach; ?>
@@ -234,27 +286,20 @@ include 'includes/header.php';
                             <span><?php echo formatPrice($current_subtotal); ?></span>
                         </div>
                         <div class="flex justify-between text-gray-600">
-                            <span>Shipping Fee</span>
-                            <span>₱150.00</span>
-                        </div>
-                        <div class="flex justify-between text-base font-extrabold text-gray-900 pt-2 border-t">
-                            <span>Total Payable</span>
-                            <span class="text-yellow-600"><?php echo formatPrice($current_subtotal + 150.00); ?></span>
+                            <span>Estimated Shipping</span>
+                            <span>P105.00 - P170.00</span>
                         </div>
                     </div>
 
                     <button type="submit" class="w-full py-3.5 bg-yellow-500 text-white font-medium rounded-xl shadow hover:bg-yellow-600 transition-colors mt-4">
                         Place Order Now
                     </button>
-
-                    <!-- Back Out / Return to Shop Button -->
                     <a href="shop.php" class="block text-center w-full py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold rounded-xl text-xs transition-colors mt-2">
                         <i class="fa-solid fa-arrow-left mr-1"></i> Back to Shop / Cancel
                     </a>
                 </div>
             </div>
         </form>
-
     <?php endif; ?>
 </div>
 

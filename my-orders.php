@@ -4,14 +4,12 @@ session_start();
 require_once 'config/database.php';
 require_once 'includes/functions.php';
 
-// Require customer to be logged in
 if (!isset($_SESSION['user_id'])) {
     redirect('login.php');
 }
 
 $user_id = $_SESSION['user_id'];
 
-// Fetch orders belonging to the logged-in customer
 try {
     $stmt = $pdo->prepare("SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC");
     $stmt->execute([$user_id]);
@@ -44,20 +42,18 @@ include 'includes/header.php';
                                 <span class="text-xs text-gray-500 block">Date Placed</span>
                                 <span class="text-sm font-medium text-gray-800"><?php echo htmlspecialchars($order['created_at']); ?></span>
                             </div>
-                            <!-- PUT IT HERE -->
                             <span class="px-3 py-1 text-xs font-bold rounded-full bg-yellow-100 text-yellow-800">
-                                <i class="fa-solid fa-check-circle mr-1"></i> Purchased
+                                <i class="fa-solid fa-check-circle mr-1"></i> <?php echo htmlspecialchars($order['status']); ?>
                             </span>
                         </div>
                     </div>
 
-                    <!-- Fetch individual items for this order -->
                     <?php
                     try {
                         $itemStmt = $pdo->prepare("
-                            SELECT order_items.*, products.name, products.image 
-                            FROM order_items 
-                            JOIN products ON order_items.product_id = products.id 
+                            SELECT order_items.*, products.name, products.image
+                            FROM order_items
+                            JOIN products ON order_items.product_id = products.id
                             WHERE order_items.order_id = ?
                         ");
                         $itemStmt->execute([$order['id']]);
@@ -89,9 +85,19 @@ include 'includes/header.php';
                     </div>
 
                     <div class="border-t pt-4 flex flex-col sm:flex-row justify-between items-start sm:items-center text-sm gap-2">
-                        <div class="text-gray-500 text-xs">
-                            <span>Courier: <strong class="text-gray-800"><?php echo htmlspecialchars($order['shipping_method'] ?? 'Standard'); ?></strong></span> | 
-                            <span>Payment: <strong class="text-gray-800"><?php echo htmlspecialchars($order['payment_method'] ?? 'COD'); ?></strong></span>
+                        <div class="text-gray-500 text-xs space-y-1">
+                            <div>
+                                <span>Courier: <strong class="text-gray-800"><?php echo htmlspecialchars($order['shipping_method'] ?? 'Standard'); ?></strong></span>
+                                <?php if (!empty($order['tracking_number'])): ?>
+                                    | <span>Waybill: <strong class="font-mono text-gray-800"><?php echo htmlspecialchars($order['tracking_number']); ?></strong></span>
+                                <?php endif; ?>
+                            </div>
+                            <div>
+                                <span>Payment: <strong class="text-gray-800"><?php echo htmlspecialchars($order['payment_method'] ?? 'COD'); ?></strong></span>
+                                <?php if (!empty($order['payment_reference'])): ?>
+                                    | <span>Ref: <strong class="font-mono text-gray-800"><?php echo htmlspecialchars($order['payment_reference']); ?></strong></span>
+                                <?php endif; ?>
+                            </div>
                         </div>
                         <div class="text-right">
                             <span class="text-gray-500 text-xs mr-2">Total Amount Paid:</span>
